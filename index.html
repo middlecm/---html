@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8" />
+<title>殺哭啦</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;display:grid;place-items:center}
+  canvas{image-rendering:pixelated;box-shadow:0 0 28px rgba(255,255,255,.14)}
+  #warn{position:fixed;left:12px;bottom:12px;color:#fff9;font:12px/1.5 ui-sans-serif,system-ui,"Noto Sans TC","PingFang TC","Microsoft JhengHei",sans-serif}
+  #hud{position:fixed;right:12px;top:12px;color:#fff9;font:12px/1.5 ui-sans-serif,system-ui}
+  #hud code{color:#fff}
+</style>
+</head>
+<body>
+
+<canvas id="cv"></canvas>
+<div id="warn"></div>
+<div id="hud"></div>
+
+<script>
+(async function(){
+  // ===== 你的參數 =====
+  const PHRASE     = "戰爭即和平自由即奴役無知即力量";
+  const FONT_SIZE  = 10; // 固定字級
+  const FONT       = `${FONT_SIZE}px "Noto Sans TC","PingFang TC","Microsoft JhengHei",ui-sans-serif,system-ui`;
+  const IMG_SRC    = "hybrid_interactive-1.jpg";
+
+  const SPEED_PPS  = 20;  // 連續右移速度（px/s）
+  const FLICK_HZ   = 0.4; // 微閃爍頻率（Hz）
+  const FLICK_AMP  = 6;   // 微閃爍振幅（灰階 ±值）
+  const SHOW_BASE  = true;
+
+  // ===== 滑鼠排斥相關（保證不重疊）=====
+  const RADIUS     = 150;   // 排斥感應半徑（px）
+  const MAX_OFFSET = 0.48; // 單字在自己格子內最多偏移比例（<=0.5 才不會跨格重疊）
+
+  const warnEl = document.getElementById('warn');
+  const hudEl  = document.getElementById('hud');
+
+  // ---- 載圖（支援 file:// 與 http://）----
+  function loadImage(src){
+    return new Promise((res, rej)=>{
+      const im = new Image();
+      const isHTTP = location.protocol === 'http:' || location.protocol === 'https:';
+      if (isHTTP) im.crossOrigin = 'anonymous';
+      let url = src;
+      if (isHTTP) url += (src.includes('?') ? '&' : '?') + 't=' + Date.now(); // 破快取
+      im.onload = ()=>res(im);
+      im.onerror = (e)=>{ rej(new Error('Image load error: '+url)); };
+      im.src = url;
+    });
+  }
+
+  let img;
+  try{
+    img = await loadImage(IMG_SRC);
+  }catch(e){
+    warnEl.innerHTML = '❌ 載入圖片失敗：<br><code>'+e.message+'</code><br>請檢查檔名/路徑，或改用本機伺服器（python -m http.server）。';
+    console.error(e);
+    return;
+  }
+
+  // ---- 畫布與離屏 ----
+  const w = img.naturalWidth || img.width;
+  const h = img.naturalHeight || img.height;
+
+  const cv = document.getElementById('cv');
+  const ctx = cv.getContext('2d');
+  cv.width = w; cv.height = h;
+  cv.style.width = w+'px';
+  cv.style.height= h+'px';
+
+  const off = document.createElement('canvas');
+  off.width = w; off.height = h;
+  const offCtx = off.getContext('2d');
+  offCtx.drawImage(img, 0, 0, w, h);
+
+  // 確認可讀像素
+  try{ offCtx.getImageData(0,0,1,1); }
+  catch(err){
+    warnEl.innerHTML = '⚠️ 讀像素失敗（跨來源保護）。<br>請用本機伺服器開啟資料夾，例如：<code>python -m http.server</code>';
+    console.error(err);
+    return;
+  }
+
+  // ---- 文字格子 ----
+  ctx.font = FONT;
+  ctx.textBaseline = "top";
+  const m = ctx.measureText("測");
+  const charW = Math.ceil(m.width);
+  const charH = Math.ceil(FONT_SIZE * 1.0); // 無間距 → 行高≈字級
+
+  const cols = Math.ceil(w / charW);
+  const rows = Math.ceil(h / charH);
+
+  const chars = Array.from(PHRASE);
+  const grid = [];
+  let idx = 0;
+  for(let j=0;j<rows;j++){
+    for(let i=0;i<cols;i++){
+      grid.push({
+        x: i * charW,
+        y: j * charH,
+        col: i,
+        row: j,
+        ch: chars[(idx++) % chars.length]
+      });
+    }
+  }
+
+  // ---- 互動狀態 ----
+  const mouse = {x:-9999,y:-9999};
+  cv.addEventListener('mousemove', e=>{
+    const r = cv.getBoundingClientRect();
+    mouse.x = e.clientX - r.left;
+    mouse.y = e.clientY - r.top;
+  });
+  cv.addEventListener('mouseleave', ()=>{mouse.x=-9999;mouse.y=-9999;});
+  cv.addEventListener('touchmove', e=>{
+    const r = cv.getBoundingClientRect();
+    const t = e.touches[0];
+    mouse.x = t.clientX - r.left;
+    mouse.y = t.clientY - r.top;
+    e.preventDefault();
+  }, {passive:false});
+  cv.addEventListener('touchend', ()=>{mouse.x=-9999;mouse.y=-9999;});
+
+  // ---- 工具 ----
+  function clamp(v,a,b){return v<a?a:(v>b?b:v);}
+  function hash2(i,j){ // 穩定相位，讓每格閃爍不同步
+    const s = Math.sin(i*12.9898 + j*78.233) * 43758.5453;
+    return s - Math.floor(s); // 0..1
+  }
+
+  // ---- 連續右移時間基準 ----
+  const t0 = performance.now();
+
+  // ---- 主繪製 ----
+  function draw(now){
+    const t = (now - t0) / 1000;          // 秒
+    const shiftPx = (t * SPEED_PPS) % w;  // 右移像素（連續）
+
+    ctx.clearRect(0,0,w,h);
+    if (SHOW_BASE) ctx.drawImage(off, 0, 0);
+
+    // 預計算排斥
+    const r2 = RADIUS * RADIUS;
+    const maxX = charW * MAX_OFFSET;
+    const maxY = charH * MAX_OFFSET;
+
+    for(const g of grid){
+      // —— 基礎右移 + 水平環繞（整體平移，維持等間距：不會重疊）
+      let baseX = g.x + shiftPx;
+      if (baseX >= w) baseX -= w; // wrap
+      const baseY = g.y;
+
+      // —— 以「格子中心 + 右移後」為基準做滑鼠排斥（限制在本格尺寸內，避免重疊）
+      const cx = baseX + charW/2;
+      const cy = baseY + charH/2;
+
+      let ox = 0, oy = 0;
+      let dx = cx - mouse.x;
+      let dy = cy - mouse.y;
+      const dist2 = dx*dx + dy*dy;
+
+      if (dist2 < r2){
+        const dist = Math.sqrt(dist2)||0.001;
+        const strength = (1 - dist/Math.sqrt(r2))**2; // 越近越大
+        dx/=dist; dy/=dist;
+        ox = dx * strength * maxX * 2;
+        oy = dy * strength * maxY * 2;
+      }
+      ox = clamp(ox,-maxX,maxX);
+      oy = clamp(oy,-maxY,maxY);
+
+      const drawX = Math.round(baseX + ox);
+      const drawY = Math.round(baseY + oy);
+
+      // —— 取樣：以「最終位置中心點」取色
+      const sx = clamp(Math.round(drawX + charW/2), 0, w-1);
+      const sy = clamp(Math.round(drawY + charH/2), 0, h-1);
+      const p = offCtx.getImageData(sx, sy, 1, 1).data;
+      let gray = Math.round(0.2126*p[0] + 0.7152*p[1] + 0.0722*p[2]);
+
+      // —— 微閃爍（不同格不同相位；幅度小而可感）
+      const phase = hash2(g.col, g.row) * Math.PI * 2;
+      const flick = Math.sin(2*Math.PI*FLICK_HZ * t + phase) * FLICK_AMP;
+      gray = clamp(Math.round(gray + flick), 0, 255);
+
+      ctx.fillStyle = `rgb(${gray},${gray},${gray})`;
+      ctx.fillText(g.ch, drawX, drawY);
+    }
+
+    // HUD
+    hudEl.innerHTML =
+      `尺寸: <code>${w}×${h}</code> | 格子: <code>${cols}×${rows}</code> | 字寬×高: <code>${charW}×${charH}</code><br>`+
+      `速度: <code>${SPEED_PPS} px/s</code> · 閃爍±<code>${FLICK_AMP}</code> · <code>${FLICK_HZ}Hz</code>`;
+
+    requestAnimationFrame(draw);
+  }
+  requestAnimationFrame(draw);
+})();
+</script>
+</body>
+</html>
